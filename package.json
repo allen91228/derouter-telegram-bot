@@ -1,13 +1,12 @@
 {
-  "name": "derouter-telegram-bot",
+  "name": "derouter-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for monitoring DeRouter earnings and controlling account dispatch speed / on-off state",
+  "description": "個人專屬 DeRouter bot：收益推播 + 自動調速",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "keywords": ["derouter", "telegram", "bot", "monitoring"],
-  "license": "MIT",
+  "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "axios": "^1.13.6",

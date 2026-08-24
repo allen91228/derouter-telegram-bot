@@ -3,18 +3,9 @@
 // ------------------------------------------
 // 依時間相位與當日收益，自動調整各帳號的 dispatch_mode。
 //
-// 帳號與排程規則全部來自 .env 的 DISPATCH_ACCOUNTS（JSON 陣列），沒設定就只留手動指令。
-//   [
-//     { "alias": "main", "email": "you@example.com",
-//       "dayMode": "speed_5x", "nightMode": "normal",
-//       "thresholdUsd": 14, "thresholdMode": "speed_2x" },
-//     { "alias": "sub",  "email": "sub@example.com",
-//       "dayMode": "speed_2x", "nightMode": "normal" }
-//   ]
-//   alias        指令用的短代號（/speed main speed_2x），選填
-//   dayMode      日間相位（台北 DISPATCH_MORNING_HOUR 起）要切到的模式
-//   nightMode    夜間相位（台北 00:00 起）要切到的模式
-//   thresholdUsd 當日收益達此金額（美元）就切到 thresholdMode，選填
+// 規格（預設值，可用 .env 覆寫）：
+//   rapidhusky344@yourmon.com：台北 08:00 → speed_5x；當日收益達 $14 → speed_2x；台北 00:00 → normal
+//   kennyf5056@gmail.com：台北 08:00 → speed_2x；台北 00:00 → normal
 //
 // 說明：
 //   - 「當日收益」用的是 /api/billing/earnings 的 today（整個容器當日總收益，
@@ -27,11 +18,12 @@
 //     （注意：寫入欄位是底線 dispatch_mode，讀回來時欄位叫 dispatchMode）
 //
 // 需要 .env：
-//   DEROUTER_MGMT_KEY      = management key（與收益模組共用）
-//   DEROUTER_CHAT_ID       = 接收調速通知的 Telegram ID
-//   DISPATCH_ACCOUNTS      = （選填）上述 JSON 陣列；留空＝不自動調速
-//   DISPATCH_MORNING_HOUR  = （選填）日間相位起始的台北小時，預設 8（＝UTC 換日）
-//   DISPATCH_ENABLED       = （選填）設 false 可暫停自動調速（仍保留 /speed 手動指令）
+//   DEROUTER_MGMT_KEY        = management key（與收益模組共用）
+//   DEROUTER_CHAT_ID         = 接收調速通知的 Telegram ID
+//   DISPATCH_c20x_EMAIL      = （選填）預設 rapidhusky344@yourmon.com
+//   DISPATCH_KENNY_EMAIL     = （選填）預設 kennyf5056@gmail.com
+//   DISPATCH_c20x_THRESHOLD  = （選填）c20x 當日降速門檻美元，預設 14
+//   DISPATCH_ENABLED         = （選填）設 false 可暫停自動調速（仍保留 /speed 手動指令）
 // ==========================================
 const axios = require('axios');
 const fs = require('fs');
@@ -45,44 +37,13 @@ const TZ = 'Asia/Taipei';
 
 const TICK_MS = 60 * 1000;       // 每分鐘檢查時間相位
 const EARN_MS = 5 * 60 * 1000;   // 每 5 分鐘檢查當日收益門檻
-// 台北 08:00＝UTC 換日、當日收益歸零時刻；可用 DISPATCH_MORNING_HOUR 覆寫
-const MORNING_HOUR = (() => {
-    const raw = (process.env.DISPATCH_MORNING_HOUR || '').trim();
-    if (raw === '') return 8;               // 未設定或留空 → 預設 8
-    const h = Number(raw);
-    return Number.isInteger(h) && h >= 0 && h <= 23 ? h : 8;
-})();
+const MORNING_HOUR = 8;          // 台北 08:00＝UTC 換日、當日收益歸零時刻
 
 const VALID_MODES = ['humanlike', 'normal', 'speed_2x', 'speed_3x', 'speed_5x'];
+const c20x_EMAIL = process.env.DISPATCH_c20x_EMAIL || 'rapidhusky344@yourmon.com';
+const KENNY_EMAIL = process.env.DISPATCH_KENNY_EMAIL || 'kennyf5056@gmail.com';
+const c20x_THRESHOLD = Number(process.env.DISPATCH_c20x_THRESHOLD) || 14;
 const ENABLED = String(process.env.DISPATCH_ENABLED || 'true').toLowerCase() !== 'false';
-
-// ---- 帳號排程設定（來自 .env 的 DISPATCH_ACCOUNTS JSON）----
-// 解析失敗或未設定 → 空陣列，代表不做自動調速，只保留 /speed、/quota 手動指令
-const ACCOUNTS = (() => {
-    const raw = (process.env.DISPATCH_ACCOUNTS || '').trim();
-    if (!raw) return [];
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    } catch (e) {
-        console.error('[dispatch] DISPATCH_ACCOUNTS 不是合法 JSON，自動調速停用:', e.message);
-        return [];
-    }
-    if (!Array.isArray(parsed)) {
-        console.error('[dispatch] DISPATCH_ACCOUNTS 必須是陣列，自動調速停用');
-        return [];
-    }
-    return parsed
-        .filter((a) => a && typeof a.email === 'string' && a.email)
-        .map((a, i) => ({
-            alias: String(a.alias || a.email.split('@')[0] || `acc${i + 1}`).toLowerCase(),
-            email: a.email,
-            dayMode: VALID_MODES.includes(a.dayMode) ? a.dayMode : null,
-            nightMode: VALID_MODES.includes(a.nightMode) ? a.nightMode : null,
-            thresholdUsd: Number(a.thresholdUsd) > 0 ? Number(a.thresholdUsd) : null,
-            thresholdMode: VALID_MODES.includes(a.thresholdMode) ? a.thresholdMode : 'speed_2x',
-        }));
-})();
 
 // ---- 狀態持久化（記錄各動作最後執行的台北日期，避免重複）----
 function loadState() {
@@ -163,8 +124,8 @@ async function fetchBudgets(containerId) {
     return Array.isArray(res.data) ? res.data : [];
 }
 
-// 指令用的短代號 → email（來自 DISPATCH_ACCOUNTS 的 alias）
-const WHO_EMAIL = Object.fromEntries(ACCOUNTS.map((a) => [a.alias, a.email]));
+// 指令用的短代號 → email
+const WHO_EMAIL = { c20x: c20x_EMAIL, kenny: KENNY_EMAIL };
 // dispatch_mode → 顯示名稱
 function modeLabel(m) {
     return { humanlike: 'Human-like', normal: 'Normal', speed_2x: 'Speed 2x', speed_3x: 'Speed 3x', speed_5x: 'Speed 5x' }[m] || m || '未知';
@@ -215,60 +176,52 @@ function initDispatch(bot) {
     }
 
     // ---- 每分鐘：依台北時間切換日/夜相位（每相位每日一次，重啟自動補位）----
-    // 夜間相位 00:00–(MORNING_HOUR-1):59 → 各帳號切到自己的 nightMode
-    // 日間相位 MORNING_HOUR:00–23:59     → 各帳號切到自己的 dayMode
+    // 相位A 00:00–07:59 → 兩帳號 normal（休息回血）
+    // 相位B 08:00–23:59 → c20x speed_5x、kenny speed_2x
     async function scheduleTick() {
-        if (!ENABLED || ACCOUNTS.length === 0) return;
+        if (!ENABLED) return;
         try {
             const { date, hour } = taipeiNow();
-            const night = hour < MORNING_HOUR;
-            const flag = night ? 'nightDate' : 'morningDate';
-            if (state[flag] === date) return;          // 這個相位今天已經跑過
-            const applied = [];
-            for (const acc of ACCOUNTS) {
-                const mode = night ? acc.nightMode : acc.dayMode;
-                if (!mode) continue;                   // 這個帳號沒設定此相位 → 不動
-                await applyMode(acc.email, mode);
-                applied.push(`${acc.alias} → ${mode}`);
-            }
-            state[flag] = date;
-            if (!night) state.thresholdDates = {};     // 新的一天，重置「已因門檻降速」旗標
-            saveState(state);
-            if (applied.length > 0) {
-                notify(`自動調速（${night ? '夜間標準' : '日間衝量'}）：${applied.join('、')}`);
+            if (hour < MORNING_HOUR) {
+                if (state.nightDate !== date) {
+                    await applyMode(c20x_EMAIL, 'normal');
+                    await applyMode(KENNY_EMAIL, 'normal');
+                    state.nightDate = date;
+                    saveState(state);
+                    notify('自動調速（夜間標準）：c20x → normal、kenny → normal');
+                }
+            } else {
+                if (state.morningDate !== date) {
+                    await applyMode(c20x_EMAIL, 'speed_5x');
+                    await applyMode(KENNY_EMAIL, 'speed_2x');
+                    state.morningDate = date;
+                    state.c20xDownDate = null; // 新的一天，重置「已因門檻降速」旗標
+                    saveState(state);
+                    notify('自動調速（日間衝量）：c20x → speed_5x、kenny → speed_2x');
+                }
             }
         } catch (e) {
             console.error('[dispatch] 相位排程失敗:', e.message);
         }
     }
 
-    // ---- 每 5 分鐘：當日收益達帳號門檻 → 切到 thresholdMode ----
-    // 僅日間相位、僅當帳號仍停在早上設定的 dayMode 時才動（避免蓋掉手動調整），每日一次
+    // ---- 每 5 分鐘：c20x 當日收益達門檻 → 降 speed_2x（僅日間、僅目前為 5x、每日一次）----
     async function thresholdTick() {
         if (!ENABLED) return;
-        const targets = ACCOUNTS.filter((a) => a.thresholdUsd != null);
-        if (targets.length === 0) return;
         try {
             const { date, hour } = taipeiNow();
-            if (hour < MORNING_HOUR) return;          // 夜間相位不套用
-            if (!state.thresholdDates) state.thresholdDates = {};
-            const pending = targets.filter((a) => state.thresholdDates[a.alias] !== date);
-            if (pending.length === 0) return;         // 今天全都降過了
+            if (hour < MORNING_HOUR) return;         // 夜間相位不套用
+            if (state.c20xDownDate === date) return;  // 今天已降過
             const today = await fetchToday();
-            const hit = pending.filter((a) => today >= a.thresholdUsd);
-            if (hit.length === 0) return;
+            if (today < c20x_THRESHOLD) return;
             const containers = await fetchContainers();
-            for (const t of hit) {
-                const acc = findAccount(containers, t.email);
-                if (!acc) continue;
-                if (t.dayMode && acc.mode !== t.dayMode) continue; // 已被手動改過 → 不覆蓋
-                if (acc.mode !== t.thresholdMode) {
-                    await setDispatch(acc.containerId, acc.accountId, t.thresholdMode);
-                }
-                state.thresholdDates[t.alias] = date;
-                saveState(state);
-                notify(`自動調速：${t.alias} 當日收益達 $${today.toFixed(2)}（≥ $${t.thresholdUsd}）→ ${t.thresholdMode}`);
-            }
+            const acc = findAccount(containers, c20x_EMAIL);
+            if (!acc) return;
+            if (acc.mode !== 'speed_5x') return;      // 只在早上設定的 5x 狀態才降，避免蓋掉手動/夜間
+            await setDispatch(acc.containerId, acc.accountId, 'speed_2x');
+            state.c20xDownDate = date;
+            saveState(state);
+            notify(`自動調速：c20x 當日收益達 $${today.toFixed(2)}（≥ $${c20x_THRESHOLD}）→ speed_2x`);
         } catch (e) {
             console.error('[dispatch] 門檻檢查失敗:', e.message);
         }
@@ -310,7 +263,7 @@ function initDispatch(bot) {
 
     // ---- 手動調速指令（僅本人）----
     // /speed                    → 互動選單（即時列出所有帳號 → 調速/啟停）
-    // /speed <email開頭> <mode> → 快速直接套用（代號＝DISPATCH_ACCOUNTS 裡的 alias）
+    // /speed <email開頭> <mode> → 快速直接套用（也支援舊代號 c20x / kenny）
     bot.onText(/^\/speed(?:@\S+)?(?:\s+(\S+))?(?:\s+(\S+))?\s*$/i, async (msg, match) => {
         if (msg.from.id !== OWNER_ID) return;
         const who = (match[1] || '').toLowerCase();
@@ -322,7 +275,7 @@ function initDispatch(bot) {
                     { message_thread_id: msg.message_thread_id });
             }
             try {
-                let email = WHO_EMAIL[who]; // alias 優先
+                let email = WHO_EMAIL[who]; // 舊代號優先
                 if (!email) {
                     const containers = await fetchContainers();
                     const hits = listAccounts(containers).filter((a) => a.email.toLowerCase().startsWith(who));
@@ -443,12 +396,7 @@ function initDispatch(bot) {
         setInterval(scheduleTick, TICK_MS);   // 每分鐘檢查相位
         setInterval(thresholdTick, EARN_MS);  // 每 5 分鐘檢查收益門檻
     }
-    const summary = ACCOUNTS.length === 0
-        ? '未設定 DISPATCH_ACCOUNTS，僅 /speed 手動'
-        : ACCOUNTS.map((a) => `${a.alias}：${String(MORNING_HOUR).padStart(2, '0')}:00→${a.dayMode || '不動'}`
-            + (a.thresholdUsd != null ? `、當日≥$${a.thresholdUsd}→${a.thresholdMode}` : '')
-            + `、00:00→${a.nightMode || '不動'}`).join('；');
-    console.log(`✅ DeRouter 自動調速模組已啟動（${ENABLED ? '排程開啟' : '排程停用'}；${summary}）`);
+    console.log(`✅ DeRouter 自動調速模組已啟動（${ENABLED ? '排程開啟' : '排程停用，僅 /speed 手動'}；c20x：08:00→5x、當日≥$${c20x_THRESHOLD}→2x、00:00→normal；kenny：08:00→2x、00:00→normal）`);
 }
 
 module.exports = { initDispatch };

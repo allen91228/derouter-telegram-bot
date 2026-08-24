@@ -1,5 +1,11 @@
 node_modules/
+
+# 機密：.env 與所有衍生的備份（.env.bak-YYYYMMDD 等）
 .env
+.env.*
+!.env.example
+
+# 執行期狀態與個人收益資料，不進版控
 *_state.json
-.DS_Store
-npm-debug.log*
+*_state.seed.json
+derouter_daily.jsonl

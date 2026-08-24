@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 // ==========================================
-// 🤖 DeRouter Telegram Bot
+// 🤖 個人專屬 DeRouter bot
 // ------------------------------------------
 //  - 收益推播（突破提醒、每日損益報告、達標提醒、/derouter 查詢）→ derouter.js
 //  - 自動調速（依時間與當日收益調 dispatch_mode、/speed 手動）    → dispatch.js
@@ -10,12 +10,12 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
-    console.error('❌ 缺少 TELEGRAM_BOT_TOKEN，請在 .env 填入向 @BotFather 申請的 bot token');
+    console.error('❌ 缺少 TELEGRAM_BOT_TOKEN，請在 .env 填入你新建的 bot token');
     process.exit(1);
 }
 
 const bot = new TelegramBot(token, { polling: true });
-console.log('🤖 DeRouter bot 已啟動');
+console.log('🤖 個人 DeRouter bot 已啟動');
 
 // 掛載兩個模組
 const { initDeRouter } = require('./derouter');
