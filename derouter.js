@@ -8,7 +8,7 @@
 //   4. 指令即時查詢：/derouter（或 /earn、/收益）
 //
 // 需要 .env 設定：
-//   DEROUTER_MGMT_KEY  = 你的 DeRouter management key
+//   DEROUTER_MGMT_KEY  = 你的 DeRouter management key（sk-mgr-...）
 //   DEROUTER_CHAT_ID   = 要接收自動推播的 Telegram ID
 //   DEROUTER_ALERT_STEP= （選填）每跨過多少美元提醒一次，預設 1
 //   DEROUTER_DAILY_HOUR= （選填）每天幾點送總結（台北時間 0–23），預設 8
@@ -22,6 +22,9 @@ const path = require('path');
 
 const API_URL = 'https://api.derouter.network/api/billing/earnings';
 const STATE_FILE = path.join(__dirname, 'derouter_state.json');
+// 每日紀錄（append-only，一天一行）。平台的 allTime 會被回頭下修、不可信，
+// 所以「本期已賺」一律以這個檔為準，state 裡的數字只是它的快取鏡像。
+const DAILY_LOG = path.join(__dirname, 'derouter_daily.jsonl');
 
 const POLL_MS = 5 * 60 * 1000;   // 每 5 分鐘輪詢一次
 // 每跨過多少美元通知一次（可用 .env 的 DEROUTER_ALERT_STEP 覆寫，預設 1＝每個整數）
@@ -64,12 +67,56 @@ function currentPeriodStart(dateStr) {
     return `${py}-${String(pm).padStart(2, '0')}-${String(pd).padStart(2, '0')}`;
 }
 
-// 本期總天數（到下一期起始日為止；+32 天必落在下一期內，再反查其起始日）
-function daysInPeriod(periodStart) {
+// 下一期的起始日（+32 天必落在下一期內，再反查其起始日）
+function nextPeriodStart(periodStart) {
     const start = new Date(`${periodStart}T00:00:00Z`);
     const probe = new Date(start.getTime() + 32 * 86400000).toISOString().slice(0, 10);
-    const nextStart = new Date(`${currentPeriodStart(probe)}T00:00:00Z`);
-    return Math.round((nextStart - start) / 86400000);
+    return currentPeriodStart(probe);
+}
+
+// 本期總天數（到下一期起始日為止）
+function daysInPeriod(periodStart) {
+    const start = new Date(`${periodStart}T00:00:00Z`);
+    const next = new Date(`${nextPeriodStart(periodStart)}T00:00:00Z`);
+    return Math.round((next - start) / 86400000);
+}
+
+// ---- 每日紀錄：讀 / 寫 / 依期別加總 ----
+function readDailyLog() {
+    try {
+        return fs.readFileSync(DAILY_LOG, 'utf8')
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+            .filter(Boolean);
+    } catch {
+        return []; // 檔案還不存在
+    }
+}
+
+function appendDaily(entry) {
+    try {
+        // 同一天只記一次：重啟或換日邏輯重跑時不會重複累加
+        if (readDailyLog().some((e) => e.date === entry.date)) return;
+        fs.appendFileSync(DAILY_LOG, JSON.stringify(entry) + '\n');
+    } catch (e) {
+        console.error('[derouter] 無法寫入每日紀錄:', e.message);
+    }
+}
+
+// 本期已賺＝紀錄檔中屬於本期的日值加總。
+// seed 行帶 days 欄位代表它一行涵蓋多天（用於沒有逐日明細的回補）。
+function sumPeriod(periodStart) {
+    const end = nextPeriodStart(periodStart);
+    let earned = 0;
+    let days = 0;
+    for (const e of readDailyLog()) {
+        if (e.date >= periodStart && e.date < end) {
+            earned += Number(e.earned) || 0;
+            days += Number(e.days) || 1;
+        }
+    }
+    return { earned, days };
 }
 
 // ---- 狀態持久化（避免重啟後重複發提醒）----
@@ -119,14 +166,18 @@ function formatDaily(d, state, taipeiDate) {
     const yd = state.yesterdayTotal;
     const lines = [`昨日收益：<b>${yd == null ? '（尚無紀錄）' : m(yd)}</b>`];
 
-    if (yd != null && DAILY_COST > 0) {
-        const pnl = yd - DAILY_COST;
+    // 日成本由月成本平攤到本期天數，避免手填的 $7×31=217 與月成本 200 對不起來
+    const totalDays = state.billingStart ? daysInPeriod(state.billingStart) : 30;
+    const dailyCost = MONTHLY_COST > 0 ? MONTHLY_COST / totalDays : DAILY_COST;
+
+    if (yd != null && dailyCost > 0) {
+        const pnl = yd - dailyCost;
         const sign = pnl >= 0 ? '+' : '-';
-        lines.push(`昨日損益：<b>${sign}$${Math.abs(pnl).toFixed(4)}</b>`);
+        lines.push(`昨日損益：<b>${sign}$${Math.abs(pnl).toFixed(4)}</b>（日成本 $${dailyCost.toFixed(2)}）`);
     }
 
-    if (state.billingStart && state.billingBaseline != null && MONTHLY_COST > 0) {
-        const earned = Number(d.allTime) - state.billingBaseline;
+    if (state.billingStart && MONTHLY_COST > 0) {
+        const { earned, days: doneDays } = sumPeriod(state.billingStart);
         const pct = (earned / MONTHLY_COST) * 100;
         const day = Math.floor(
             (new Date(`${taipeiDate}T00:00:00Z`) - new Date(`${state.billingStart}T00:00:00Z`)) / 86400000
@@ -134,16 +185,21 @@ function formatDaily(d, state, taipeiDate) {
         const filled = Math.max(0, Math.min(20, Math.round(pct / 5))); // 20 格，每格 5%
         lines.push(
             '',
-            `本期進度（第 ${day} 天）`,
+            `本期進度（第 ${day} 天／共 ${totalDays} 天）`,
             `　已賺 $${earned.toFixed(2)} ／ 月成本 $${MONTHLY_COST}（${pct.toFixed(1)}%）`,
             `　${'▓'.repeat(filled)}${'░'.repeat(20 - filled)}`
         );
-        // 早上 8 點報告時「第 N 天」剛開始，已完成 N-1 個整天；第 1 天資料不足不推估
-        const doneDays = day - 1;
         if (doneDays >= 1) {
-            const projected = (earned / doneDays) * daysInPeriod(state.billingStart);
-            lines.push(`　推估月底約 $${Math.round(projected)}`);
+            // 已賺的部分是事實，不再拿日均去重估它；只用日均推「剩下還沒發生的天數」
+            const avg = earned / doneDays;
+            const remaining = Math.max(0, totalDays - day + 1);
+            const projected = earned + remaining * avg;
+            lines.push(`　日均 $${avg.toFixed(2)}（${doneDays} 天）／剩 ${remaining} 天`);
+            lines.push(`　推估期末約 $${Math.round(projected)}`);
         }
+        // 回寫快取鏡像，方便直接看 state 檔除錯；真相仍以紀錄檔為準
+        state.periodEarned = earned;
+        state.periodDays = doneDays;
     }
 
     lines.push('', `累計 AllTime：<b>${m(d.allTime)}</b>`, `Requests Served：<b>${d.requestsAll}</b>`);
@@ -161,15 +217,30 @@ function trackToday(state, d) {
         const yesterdayStr = prev.toISOString().slice(0, 10);
         state.yesterdayTotal = state.todayDate === yesterdayStr ? state.todayValue : null;
         state.todayDate = nowDate;
+        // 把封存好的昨日數字寫進紀錄檔。不能用 allTime 差值算本期收益：平台會回頭下修
+        // （實測 8/4–8/24 錢包進帳 300.89，同期 allTime 只長 136.50），差值算法會愈跑愈負。
+        // 只在昨天資料連續時記錄；中斷過就留缺行，寧可少算也不要記到錯的一天。
+        if (state.yesterdayTotal != null) {
+            appendDaily({
+                date: yesterdayStr,
+                earned: state.yesterdayTotal,
+                tasks: state.todayTasks ?? null,
+                allTime: Number(d.allTime),   // 留存平台當下的累計值，日後可回查它被下修多少
+                period: BILLING_START ? currentPeriodStart(yesterdayStr) : null,
+            });
+        } else {
+            console.warn(`[derouter] ${nowDate} 換日時無連續的昨日資料，紀錄檔留缺行`);
+        }
     }
     state.todayValue = Number(d.today);
-    // 進入新的一期（含第一次啟動）時記下基準：本期已賺＝目前 allTime − 基準
-    // 基準扣掉 d.today，讓「換期當天已跑出的收益」也算進新的一期
+    state.todayTasks = Number(d.todayTasks);
+    // 進入新的一期（含第一次啟動）時記下基準（僅供對帳參考；本期已賺改由紀錄檔推導）
     if (BILLING_START) {
         const periodStart = currentPeriodStart(nowDate);
         if (state.billingStart !== periodStart) {
             state.billingStart = periodStart;
             state.billingBaseline = Number(d.allTime) - Number(d.today);
+            // periodEarned／periodDays 不必歸零：由紀錄檔依期別推導，換期自然從 0 起算
         }
     }
     saveState(state);
