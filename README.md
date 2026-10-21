@@ -43,6 +43,8 @@ pm2 start index.js --name derouter-bot
 pm2 save
 ```
 
+使用 RackNerd 等 Linux VPS 時，可依 [systemd 部署說明](deploy/README.md) 安裝常駐服務，並搬移現有收益日誌與鏈上快取。
+
 ## 設定
 
 完整說明見 [`.env.example`](.env.example)，以下是必填三項：
