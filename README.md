@@ -63,7 +63,9 @@ pm2 save
 
 鏈上統計使用 `finalized` 交易，只加總 DeRouter settlement 程式的 Settle 指令內，轉入指定錢包 USDC 帳戶的款項，排除充值與一般轉帳。首次由帳號清單探索接收錢包，之後快取於 `chain_state.json`；也可先填入 `DEROUTER_WALLET`，使 DeRouter API 全部不可達時仍可查鏈。RPC URL 可由 `DEROUTER_SOLANA_RPC_URL` 設定；無須錢包私鑰。
 
-預設每次最多讀取最近 100 筆交易，可用 `DEROUTER_CHAIN_MAX_TRANSACTIONS` 調整（1–1000）。結果標示掃描範圍，未覆蓋完整 UTC 日／週時標示「部分」；週從 UTC 週一開始。不把未掃完的合計稱作累計收益，也不還原 task 數。鏈上只反映已結算 USDC，會與 API 未結算收益不同；不寫入 API 收益日誌、不用 API 歷史推估鏈上收益率。
+啟動時自動在背景同步，每 30 秒處理一輪；每輪預設 10 筆，可用 `DEROUTER_CHAIN_MAX_TRANSACTIONS` 調整（1–100）。RPC 請求至少間隔 500 毫秒，失敗時自動退避至最長 5 分鐘。新交易增量查詢與歷史分頁游標、待處理佇列、逐筆結算結果都持久化至 `chain_state.json`，重啟後繼續；交替處理新舊交易並輪流補齊各 USDC 帳戶。快取採暫存檔加原子更名，`chain_state.json` 與 `.tmp` 都列入 `.gitignore`。
+
+指令直接回覆本機快取，顯示更新時間與同步進度；第一次尚無快取時顯示背景同步中。所有已掃描交易持續累積且依簽章去重。結果標示掃描範圍，未覆蓋完整 UTC 日／週時標示「部分」；週從 UTC 週一開始。不把未掃完的合計稱作累計收益，也不還原 task 數。鏈上只反映已結算 USDC，會與 API 未結算收益不同；不寫入 API 收益日誌、不用 API 歷史推估鏈上收益率。
 
 ### 月成本
 

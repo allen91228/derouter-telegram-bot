@@ -28,11 +28,13 @@ function transaction() {
     };
 }
 
-function loadChain(handler, max = 10) {
-    let saved = {};
+function loadChain(handler, max = 10, initial = {}) {
+    let saved = initial;
     const writes = [];
     const sandbox = {
         module: { exports: {} }, Buffer, console,
+        setTimeout: (fn, delay) => { if (delay > 0 && delay <= 500) queueMicrotask(fn); return { unref() {} }; },
+        clearTimeout() {},
         process: { env: { DEROUTER_WALLET: WALLET, DEROUTER_CHAIN_MAX_TRANSACTIONS: String(max) } },
         __dirname: path.resolve(__dirname, '..'),
         require: name => {
@@ -40,12 +42,13 @@ function loadChain(handler, max = 10) {
             if (name === 'fs') return {
                 readFileSync: () => JSON.stringify(saved),
                 writeFileSync: (file, data) => { saved = JSON.parse(data); writes.push(file); },
+                renameSync: (from, to) => writes.push(to),
             };
             return require(name);
         },
     };
     vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, '../chain-earnings.js'), 'utf8'), sandbox);
-    return { ...sandbox.module.exports, writes };
+    return { ...sandbox.module.exports, writes, saved: () => JSON.parse(JSON.stringify(saved)) };
 }
 
 test('counts only finalized successful DeRouter USDC settlement receipts', () => {
@@ -74,21 +77,23 @@ test('discovers USDC accounts, scans receipts, caches transactions and keeps API
         reads += 1;
         return transaction();
     });
+    await chain.syncChainOnce();
     const result = await chain.fetchChainEarnings();
     assert.equal(result.today, 1.234567);
     assert.equal(result.week, 1.234567);
     assert.equal(result.todayComplete, true);
     await chain.fetchChainEarnings();
     assert.equal(reads, 1);
-    assert.ok(chain.writes.every(file => file.endsWith('chain_state.json')));
+    assert.ok(chain.writes.every(file => /chain_state.json(?:\.tmp)?$/.test(file)));
 });
 
 test('capped scans are visibly partial rather than presented as lifetime totals', async () => {
     const chain = loadChain(method => {
         if (method === 'getTokenAccountsByOwner') return { value: [{ pubkey: 'ata' }] };
-        if (method === 'getSignaturesForAddress') return [{ signature: 'one', err: null, blockTime: transaction().blockTime }];
+        if (method === 'getSignaturesForAddress') return ['one', 'two'].map(signature => ({ signature, err: null, blockTime: transaction().blockTime }));
         return transaction();
     }, 1);
+    await chain.syncChainOnce();
     const result = await chain.fetchChainEarnings();
     assert.equal(result.todayComplete, false);
     assert.equal(result.weekComplete, false);
@@ -101,5 +106,61 @@ test('capped scans are visibly partial rather than presented as lifetime totals'
 
 test('RPC failure does not manufacture zero earnings', async () => {
     const chain = loadChain(() => { throw new Error('RPC offline'); });
-    await assert.rejects(chain.fetchChainEarnings(), /RPC offline/);
+    await assert.rejects(chain.syncChainOnce(), /RPC offline/);
+    assert.match(chain.formatChainEarnings(await chain.fetchChainEarnings()), /首次背景同步中/);
+});
+
+test('history cursors and queued work survive restart; newest and oldest jobs both progress', async () => {
+    const fetched = [];
+    const recent = Array.from({ length: 100 }, (_, i) => ({ signature: `sig${i}`, blockTime: transaction().blockTime - i, err: null }));
+    const older = [100, 101].map(i => ({ signature: `sig${i}`, blockTime: transaction().blockTime - i, err: null }));
+    const handler = (method, params) => {
+        if (method === 'getTokenAccountsByOwner') return { value: [{ pubkey: 'ata' }] };
+        if (method === 'getSignaturesForAddress') {
+            if (params[1].before === 'sig99') return older;
+            if (params[1].until) return [];
+            return recent;
+        }
+        fetched.push(params[0]);
+        return transaction();
+    };
+    const chain = loadChain(handler, 1);
+    await chain.syncChainOnce();
+    assert.equal(chain.saved().addresses.ata.historyDone, true);
+    assert.equal(Object.keys(chain.saved().pending).length, 101);
+    const restarted = loadChain(handler, 1, chain.saved());
+    await restarted.syncChainOnce();
+    assert.deepEqual(fetched, ['sig0', 'sig101']);
+    assert.equal(Object.keys(restarted.saved().transactions).length, 2);
+    assert.equal((await restarted.fetchChainEarnings()).scanned, 2.469134);
+    assert.equal(Object.keys(restarted.saved().pending).length, 100);
+});
+
+test('cache reads do not call RPC and retain data while the next job fails', async () => {
+    const initial = {
+        wallet: WALLET, tokenAccounts: ['ata'], discoveredAt: new Date().toISOString(),
+        transactions: { cached: { time: transaction().blockTime, amount: '1234567' } },
+        pending: { next: { time: transaction().blockTime } },
+        addresses: { ata: { initialized: true, head: 'cached', historyDone: true, syncedAt: new Date().toISOString() } },
+    };
+    let calls = 0;
+    const chain = loadChain(() => { calls += 1; throw new Error('rate limited'); }, 1, initial);
+    assert.equal((await chain.fetchChainEarnings()).scanned, 1.234567);
+    assert.equal(calls, 0);
+    await assert.rejects(chain.syncChainOnce(), /rate limited/);
+    assert.equal((await chain.fetchChainEarnings()).scanned, 1.234567);
+    assert.equal(Object.keys(chain.saved().pending).length, 1);
+    assert.ok(chain.saved().lastError);
+});
+
+test('stale snapshots retain totals but do not claim complete current-day coverage', async () => {
+    const chain = loadChain(() => { throw new Error('cache read must not use RPC'); }, 1, {
+        wallet: WALLET, tokenAccounts: ['ata'],
+        transactions: { old: { time: transaction().blockTime, amount: '1234567' } },
+        addresses: { ata: { initialized: true, historyDone: true, syncedAt: '2020-01-01T00:00:00Z' } },
+    });
+    const snapshot = await chain.fetchChainEarnings();
+    assert.equal(snapshot.scanned, 1.234567);
+    assert.equal(snapshot.todayComplete, false);
+    assert.equal(snapshot.weekComplete, false);
 });
