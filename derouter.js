@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const { fetchMonthlyCost, formatMonthlyCost } = require('./costs');
 const { fetchEarnings } = require('./earnings-api');
+const { fetchChainEarnings, formatChainEarnings } = require('./chain-earnings');
 
 const STATE_FILE = path.join(__dirname, 'derouter_state.json');
 // 每日紀錄（append-only，一天一行）。平台的 allTime 會被回頭下修、不可信，
@@ -317,8 +318,8 @@ function taipeiNow() {
 // 主啟動函式：把整個模組掛到既有的 bot 上
 // ==========================================
 function initDeRouter(bot) {
-    if (!process.env.DEROUTER_MGMT_KEY || !process.env.DEROUTER_CHAT_ID) {
-        console.warn('[derouter] 未設定 DEROUTER_MGMT_KEY 或 DEROUTER_CHAT_ID，收益模組略過啟動');
+    if (!process.env.DEROUTER_CHAT_ID) {
+        console.warn('[derouter] 未設定 DEROUTER_CHAT_ID，收益模組略過啟動');
         return;
     }
     const CHAT_ID = process.env.DEROUTER_CHAT_ID;
@@ -326,19 +327,36 @@ function initDeRouter(bot) {
     let state = loadState();
 
     // ---- 指令：即時查詢（僅限本人）----
-    bot.onText(/^\/(derouter|earn|收益)\b/, async (msg) => {
+    bot.onText(/^\/(derouter|earn|收益)(?:@\w+)?(?:\s+(auto|api|chain))?\s*$/i, async (msg, match) => {
         if (msg.from.id !== OWNER_ID) return; // 非本人一律忽略，保護個人收益隱私
+        const selected = match?.[2]?.toLowerCase();
+        if (selected) {
+            state.earningsSource = selected;
+            saveState(state);
+        }
+        const source = ['api', 'chain'].includes(state.earningsSource) ? state.earningsSource : 'auto';
+        const reply = text => bot.sendMessage(msg.chat.id, text, {
+            parse_mode: 'HTML', message_thread_id: msg.message_thread_id,
+        });
         try {
-            const d = await fetchEarnings();
+            if (source === 'chain') {
+                await reply(formatChainEarnings(await fetchChainEarnings()));
+                return;
+            }
+            let d;
+            try { d = await fetchEarnings(); }
+            catch (apiError) {
+                if (source === 'api') throw apiError;
+                console.error('[derouter] API 無法讀取，切換鏈上統計:', apiError.message);
+                await reply(formatChainEarnings(await fetchChainEarnings(), true));
+                return;
+            }
             trackToday(state, d);
             saveState(state);
             let cost = null;
             try { cost = await fetchMonthlyCost(); }
             catch (e) { console.error('[derouter] 月成本讀取失敗:', e.message); }
-            bot.sendMessage(msg.chat.id, formatEarnings(d, formatExpectedReturn(d, cost)), {
-                parse_mode: 'HTML',
-                message_thread_id: msg.message_thread_id,
-            });
+            await reply(formatEarnings(d, formatExpectedReturn(d, cost)));
         } catch (e) {
             bot.sendMessage(msg.chat.id, `❌ 讀取 DeRouter 收益失敗：${e.message}`, {
                 message_thread_id: msg.message_thread_id,

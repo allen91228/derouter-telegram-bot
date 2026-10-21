@@ -57,6 +57,14 @@ pm2 save
 
 若 API 回覆 `Manager key lacks scope: usage`（`scope_denied`），代表目前金鑰缺少收益讀取權限。請在 DeRouter 後台為金鑰啟用 `usage`；若需建立新金鑰，保留現有帳號管理權限，更新 `.env` 的 `DEROUTER_MGMT_KEY` 後重啟 bot。帳號清單與 `/quota` 能讀取，不代表金鑰有收益讀取權限。
 
+### 切換收益來源與鏈上備援
+
+`/derouter auto`（預設）優先讀取收益 API，API 請求失敗時改查 Solana；`/derouter api` 固定使用 API；`/derouter chain` 固定使用鏈上統計。選擇會保存在狀態檔，之後直接 `/derouter` 沿用。`/earn`、`/收益` 也支援這些參數。來源切換只影響指令查詢，排程推播與自動調速仍使用 API。
+
+鏈上統計使用 `finalized` 交易，只加總 DeRouter settlement 程式的 Settle 指令內，轉入指定錢包 USDC 帳戶的款項，排除充值與一般轉帳。首次由帳號清單探索接收錢包，之後快取於 `chain_state.json`；也可先填入 `DEROUTER_WALLET`，使 DeRouter API 全部不可達時仍可查鏈。RPC URL 可由 `DEROUTER_SOLANA_RPC_URL` 設定；無須錢包私鑰。
+
+預設每次最多讀取最近 100 筆交易，可用 `DEROUTER_CHAIN_MAX_TRANSACTIONS` 調整（1–1000）。結果標示掃描範圍，未覆蓋完整 UTC 日／週時標示「部分」；週從 UTC 週一開始。不把未掃完的合計稱作累計收益，也不還原 task 數。鏈上只反映已結算 USDC，會與 API 未結算收益不同；不寫入 API 收益日誌、不用 API 歷史推估鏈上收益率。
+
 ### 月成本
 
 不再使用 `DEROUTER_MONTHLY_COST`。每次查詢以目前掛載的帳號數量乘上美區月繳牌價（未稅、不含額外用量與優惠），暫停、封鎖、過期帳號仍列入；相同平台與 email 跨容器重複掛載只計一次。這是目前帳號組合的牌價估算，不是實際帳單，也不追溯本期內帳號異動的分攤費用。
